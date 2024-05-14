@@ -7,27 +7,19 @@ package cache
 import (
 	"context"
 	_ "embed"
-	"encoding/base64"
 	"fmt"
-	"strings"
 
-	extensionswebhook "github.com/gardener/gardener/extensions/pkg/webhook"
 	gcontext "github.com/gardener/gardener/extensions/pkg/webhook/context"
 	"github.com/gardener/gardener/extensions/pkg/webhook/controlplane/genericmutator"
 	v1beta1helper "github.com/gardener/gardener/pkg/apis/core/v1beta1/helper"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	"github.com/go-logr/logr"
+	"golang.org/x/exp/maps"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/gardener/gardener-extension-registry-cache/pkg/apis/registry"
-)
-
-var (
-	//go:embed scripts/configure-containerd-registries.sh
-	configureContainerdRegistriesScript string
 )
 
 // NewEnsurer creates a new registry cache ensurer.
@@ -46,24 +38,7 @@ type ensurer struct {
 	logger  logr.Logger
 }
 
-// EnsureAdditionalFiles ensures that the configure-containerd-registries.sh script is added to the <new> files.
-func (e *ensurer) EnsureAdditionalFiles(_ context.Context, _ gcontext.GardenContext, new, _ *[]extensionsv1alpha1.File) error {
-	*new = extensionswebhook.EnsureFileWithPath(*new, extensionsv1alpha1.File{
-		Path:        "/opt/bin/configure-containerd-registries.sh",
-		Permissions: ptr.To(int32(0744)),
-		Content: extensionsv1alpha1.FileContent{
-			Inline: &extensionsv1alpha1.FileContentInline{
-				Encoding: "b64",
-				Data:     base64.StdEncoding.EncodeToString([]byte(configureContainerdRegistriesScript)),
-			},
-		},
-	})
-
-	return nil
-}
-
-// EnsureAdditionalUnits ensures that the configure-containerd-registries.service unit is added to the <new> units.
-func (e *ensurer) EnsureAdditionalUnits(ctx context.Context, gctx gcontext.GardenContext, new, _ *[]extensionsv1alpha1.Unit) error {
+func (e *ensurer) EnsureContainerdConfig(ctx context.Context, gctx gcontext.GardenContext, new, _ *extensionsv1alpha1.CRIConfig) error {
 	cluster, err := gctx.GetCluster(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get the cluster resource: %w", err)
@@ -100,31 +75,33 @@ func (e *ensurer) EnsureAdditionalUnits(ctx context.Context, gctx gcontext.Garde
 		return fmt.Errorf("failed to decode providerStatus of extension '%s': %w", client.ObjectKeyFromObject(extension), err)
 	}
 
-	scriptArgs := make([]string, 0, len(registryStatus.Caches))
+	// TODO(timuthy): Clarify registry readiness probe, see https://github.com/gardener/gardener-extension-registry-cache/blob/6e0e858a1daab1772fe259ae28afc3d3ba1fa726/pkg/webhook/cache/scripts/configure-containerd-registries.sh#L61
+
+	upstreamToRegistry := make(map[string]extensionsv1alpha1.RegistryConfig)
 	for _, cache := range registryStatus.Caches {
-		scriptArgs = append(scriptArgs, fmt.Sprintf("%s,%s,%s", cache.Upstream, cache.Endpoint, cache.RemoteURL))
+		upstreamToRegistry[cache.Upstream] = extensionsv1alpha1.RegistryConfig{
+			Upstream: cache.Upstream,
+			Server:   &cache.RemoteURL,
+			Hosts: []extensionsv1alpha1.RegistryHost{
+				{URL: cache.Endpoint, Capabilities: []string{"pull", "resolve"}},
+			},
+		}
 	}
 
-	unit := extensionsv1alpha1.Unit{
-		Name:    "configure-containerd-registries.service",
-		Command: ptr.To(extensionsv1alpha1.CommandStart),
-		Enable:  ptr.To(true),
-		Content: ptr.To(`[Unit]
-Description=Configures containerd registries
-
-[Install]
-WantedBy=multi-user.target
-
-[Unit]
-After=containerd.service
-Requires=containerd.service
-
-[Service]
-Type=simple
-ExecStart=/opt/bin/configure-containerd-registries.sh ` + strings.Join(scriptArgs, " ")),
+	if new.Containerd == nil && len(registryStatus.Caches) > 0 {
+		new.Containerd = &extensionsv1alpha1.ContainerdConfig{}
 	}
 
-	*new = extensionswebhook.EnsureUnitWithName(*new, unit)
+	for i, reg := range new.Containerd.Registries {
+		existingReg, ok := upstreamToRegistry[reg.Upstream]
+		if !ok {
+			continue
+		}
+		new.Containerd.Registries[i].Server = existingReg.Server
+		new.Containerd.Registries[i].Hosts = existingReg.Hosts
+		delete(upstreamToRegistry, existingReg.Upstream)
+	}
 
+	new.Containerd.Registries = append(new.Containerd.Registries, maps.Values(upstreamToRegistry)...)
 	return nil
 }
